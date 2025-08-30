@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-# generator.py — Train a GPT-style Transformer (BPE, RoPE, SwiGLU) on GPU and export GGUFx.
-# + Flask UI with streaming progress (SSE via queue+thread).
+# generator.py — Train a GPT-style Transformer (BPE, RoPE, SwiGLU) on GPU and export a single GGUF file.
+# - Tokenizer is embedded into GGUF (tokens + merges), no external JSON artifacts.
+# - Flask UI with SSE streaming (queue+thread), progress, s/it, env diagnostics, single-run lock.
 # Author: Artur Strazewicz — 2025 — MIT
 
-import argparse, json, math, os, time, struct, mmap, io
+import argparse, json, math, os, time, struct, mmap, io, tempfile, hashlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
+from typing import Optional
 
 import numpy as np
 import torch
@@ -16,9 +18,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# ----------------------------
-# Optional tokenizer deps (BPE)
-# ----------------------------
+# ============================================================
+# BPE tokenizer (HF tokenizers) — no external JSON persisted
+# ============================================================
 try:
     from tokenizers import Tokenizer
     from tokenizers.models import BPE
@@ -29,167 +31,58 @@ try:
 except Exception:
     HAVE_TOKENIZERS = False
 
-# ----------------------------
-# GGUF-like writer/reader (GGUFx)
-# ----------------------------
-DTYPE_MAP = { 'float32':0, 'float16':1, 'bfloat16':2, 'int8':3 }
-INV_DTYPE_MAP = {v:k for k,v in DTYPE_MAP.items()}
-NP_DTYPE = {
-    'float32': np.float32,
-    'float16': np.float16,
-    'bfloat16': np.uint16,  # store raw BF16 as u16
-    'int8': np.int8,
-}
-def align64(x): return (x + 63) & ~63
-
-class GGUFxWriter:
-    def __init__(self, path:str, meta:dict):
-        self.path = path
-        self.meta = meta
-        self.entries = []
-    def add_tensor(self, name:str, arr:np.ndarray):
-        assert arr.flags['C_CONTIGUOUS']
-        dtype = str(arr.dtype)
-        if dtype == 'uint16':  # our BF16 packing
-            dtype = 'bfloat16'
-        if dtype not in DTYPE_MAP:
-            raise ValueError(f"Unsupported dtype: {dtype}")
-        self.entries.append({
-            'name': name,
-            'dtype': dtype,
-            'shape': list(arr.shape),
-            'nbytes': arr.nbytes,
-            'data': arr,
-        })
-    def write(self):
-        meta_bytes = json.dumps(self.meta, ensure_ascii=False).encode('utf-8')
-        with open(self.path, 'wb') as f:
-            f.write(b'GGUFx\x00')
-            f.write(struct.pack('<I', 1))  # version
-            f.write(struct.pack('<I', len(meta_bytes)))
-            f.write(meta_bytes)
-            f.write(struct.pack('<I', len(self.entries)))
-            # index
-            index = io.BytesIO()
-            data_off = 0
-            for e in self.entries:
-                name_b = e['name'].encode('utf-8')
-                index.write(struct.pack('<H', len(name_b)))
-                index.write(name_b)
-                index.write(struct.pack('<B', DTYPE_MAP[e['dtype']]))
-                index.write(struct.pack('<B', len(e['shape'])))
-                for d in e['shape']:
-                    index.write(struct.pack('<I', d))
-                index.write(struct.pack('<Q', data_off))
-                data_off += e['nbytes']
-            f.write(index.getvalue())
-            pad = align64(f.tell()) - f.tell()
-            if pad: f.write(b'\x00'*pad)
-            # data
-            for e in self.entries:
-                f.write(e['data'].tobytes(order='C'))
-        return self.path
-
-class GGUFxReader:
-    def __init__(self, path:str):
-        self.path = path
-        self.meta = {}
-        self.tensors = {}
-        self._load()
-    def _load(self):
-        with open(self.path, 'rb') as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            assert mm.read(6) == b'GGUFx\x00'
-            ver = struct.unpack('<I', mm.read(4))[0]; assert ver == 1
-            meta_len = struct.unpack('<I', mm.read(4))[0]
-            self.meta = json.loads(mm.read(meta_len).decode('utf-8'))
-            n = struct.unpack('<I', mm.read(4))[0]
-            entries = []
-            for _ in range(n):
-                name_len = struct.unpack('<H', mm.read(2))[0]
-                name = mm.read(name_len).decode('utf-8')
-                dt = INV_DTYPE_MAP[mm.read(1)[0]]
-                ndim = mm.read(1)[0]
-                shape = [struct.unpack('<I', mm.read(4))[0] for __ in range(ndim)]
-                off = struct.unpack('<Q', mm.read(8))[0]
-                entries.append((name, dt, shape, off))
-            data_start = align64(mm.tell())
-            for name, dt, shape, off in entries:
-                npdt = NP_DTYPE[dt]
-                byte_offset = data_start + off
-                arr = np.memmap(self.path, dtype=npdt, mode='r', shape=tuple(shape), offset=byte_offset)
-                self.tensors[name] = arr
-            mm.close()
-
-# ----------------------------
-# Tokenizers
-# ----------------------------
-class SimpleCharTokenizer:
-    def __init__(self):
-        self.stoi = {"<pad>":0, "<bos>":1, "<eos>":2}
-        self.itos = ["<pad>","<bos>","<eos>"]
-    def train_from_text(self, text:str):
-        for ch in sorted(set(text)):
-            if ch not in self.stoi:
-                self.stoi[ch] = len(self.itos)
-                self.itos.append(ch)
-    @property
-    def vocab_size(self): return len(self.itos)
-    def encode(self, s:str):
-        ids = [self.stoi.get(ch,0) for ch in s]
-        return [1] + ids + [2]
-    def decode(self, ids):
-        toks = []
-        for i in ids:
-            if i < len(self.itos):
-                t = self.itos[i]
-                if t not in ("<pad>","<bos>","<eos>"):
-                    toks.append(t)
-        return "".join(toks)
-    def save(self, path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"type":"char","itos":self.itos}, f)
-    @staticmethod
-    def load(path):
-        obj = json.load(open(path,"r",encoding="utf-8"))
-        t = SimpleCharTokenizer()
-        t.itos = obj["itos"]
-        t.stoi = {s:i for i,s in enumerate(t.itos)}
-        return t
-
 class BPETokenizerWrapper:
-    def __init__(self, tok):
+    def __init__(self, tok: "Tokenizer"):
         self.tok = tok
     @property
     def vocab_size(self): return self.tok.get_vocab_size()
-    def encode(self, s): return [1] + self.tok.encode(s).ids + [2]
+    def encode(self, s: str): return [1] + self.tok.encode(s).ids + [2]   # <bos> ... <eos>
     def decode(self, ids):
         core = [i for i in ids if i not in (0,1,2)]
         return self.tok.decode(core)
-    def save(self, path): self.tok.save(path)
-    @staticmethod
-    def load(path): return BPETokenizerWrapper(Tokenizer.from_file(path))
 
-def build_tokenizer(corpus_path:Path, vocab_size:int, out_path:Path):
+def dataset_hash(path: Path, vocab_size: int) -> str:
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1<<20), b''):
+            h.update(chunk)
+    h.update(str(vocab_size).encode())
+    return h.hexdigest()[:12]
+
+def build_bpe_tokenizer_and_extract_tables(corpus_path: Path, vocab_size: int):
+    """Train BPE once in-memory; extract tokens/merges by saving to a temp JSON (not persisted)."""
     text = corpus_path.read_text(encoding='utf-8')
-    if HAVE_TOKENIZERS:
-        tok = Tokenizer(BPE(unk_token="<unk>"))
-        tok.pre_tokenizer = ByteLevel()
-        tok.decoder = ByteLevelDecoder()
-        trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=["<pad>","<bos>","<eos>","<unk>"])
-        tok.train_from_iterator([text], trainer)
-        wrapper = BPETokenizerWrapper(tok)
-        wrapper.save(str(out_path))
-        return wrapper
-    else:
-        t = SimpleCharTokenizer()
-        t.train_from_text(text)
-        t.save(str(out_path))
-        return t
+    tok = Tokenizer(BPE(unk_token="<unk>"))
+    tok.pre_tokenizer = ByteLevel()
+    tok.decoder = ByteLevelDecoder()
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=["<pad>","<bos>","<eos>","<unk>"])
+    tok.train_from_iterator([text], trainer)
 
-# ----------------------------
+    # Save to a temp JSON to extract tokens/merges tables (we delete it immediately)
+    with tempfile.NamedTemporaryFile('w+', suffix='.json', delete=False, encoding='utf-8') as tf:
+        tmp_path = tf.name
+    try:
+        tok.save(tmp_path)
+        obj = json.loads(Path(tmp_path).read_text(encoding='utf-8'))
+        # Expected HF tokenizers layout:
+        # obj["model"]["vocab"] : dict token -> id
+        # obj["model"]["merges"]: list of "A B" strings
+        vocab = obj.get("model", {}).get("vocab", {})
+        inv = {i:t for t,i in vocab.items()}
+        max_id = max(inv) if inv else -1
+        tokens = [inv.get(i, "") for i in range(max_id+1)]
+        merges = obj.get("model", {}).get("merges", [])
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return BPETokenizerWrapper(tok), tokens, merges
+
+# ============================================================
 # Dataset
-# ----------------------------
+# ============================================================
 class TextDataset(Dataset):
     def __init__(self, text_ids, block_size):
         self.ids = text_ids
@@ -200,9 +93,9 @@ class TextDataset(Dataset):
         y = torch.tensor(self.ids[i+1:i+self.block+1], dtype=torch.long)
         return x, y
 
-# ----------------------------
-# Model (RoPE + SwiGLU)
-# ----------------------------
+# ============================================================
+# Model (RoPE + SwiGLU, pre-LN, tied head)
+# ============================================================
 @dataclass
 class GPTConfig:
     vocab_size: int
@@ -230,8 +123,7 @@ class MLP(nn.Module):
         super().__init__()
         hidden = int(4 * cfg.n_embd * 2 / 3)  # 2/3 rule for SwiGLU sizing
         self.swiglu = SwiGLU(cfg.n_embd, hidden, bias=cfg.bias, dropout=cfg.dropout)
-    def forward(self, x):
-        return self.swiglu(x)
+    def forward(self, x): return self.swiglu(x)
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0):
@@ -306,6 +198,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        # tied weights
         self.lm_head.weight = self.tok_emb.weight
     def forward(self, idx, targets=None):
         B,T = idx.size()
@@ -323,9 +216,126 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-# ----------------------------
+# ============================================================
+# GGUF v3 writer (weights + tokenizer kv)
+# ============================================================
+GGUF_MAGIC = b"GGUF"
+GGUF_VERSION = 3
+
+# KV types (minimal set)
+GGUF_TYPE_UINT32 = 2
+GGUF_TYPE_FLOAT32 = 5
+GGUF_TYPE_BOOL   = 8
+GGUF_TYPE_STRING = 9
+GGUF_TYPE_ARRAY  = 10
+
+# Array element types
+GGUF_ARRAY_UINT32  = 2
+GGUF_ARRAY_FLOAT32 = 5
+GGUF_ARRAY_STRING  = 9
+
+# Tensor dtype codes (simplified)
+T_DTYPE_MAP = { 'float32':0, 'float16':1, 'bfloat16':2, 'int8':3 }
+
+def align_to(f, multiple=32):
+    pos = f.tell()
+    pad = (-pos) % multiple
+    if pad: f.write(b'\x00'*pad)
+
+class GGUFWriter:
+    def __init__(self, path: str):
+        self.path = path
+        self.kv = []      # list of (key, (type, payload))
+        self.tensors = [] # list of (name, np_array)
+    # --- KV helpers ---
+    def add_u32(self, key, v:int):      self.kv.append((key, (GGUF_TYPE_UINT32, v)))
+    def add_f32(self, key, v:float):    self.kv.append((key, (GGUF_TYPE_FLOAT32, v)))
+    def add_bool(self, key, v:bool):    self.kv.append((key, (GGUF_TYPE_BOOL, bool(v))))
+    def add_str(self, key, s:str):      self.kv.append((key, (GGUF_TYPE_STRING, s)))
+    def add_arr_str(self, key, arr:list[str]):
+        self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_STRING, arr))))
+    def add_arr_f32(self, key, arr:list[float]):
+        self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_FLOAT32, arr))))
+    def add_arr_u32(self, key, arr:list[int]):
+        self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_UINT32, arr))))
+    # --- tensors ---
+    def add_tensor(self, name: str, np_arr: np.ndarray):
+        assert np_arr.flags['C_CONTIGUOUS']
+        self.tensors.append((name, np_arr))
+
+    def _w_u32(self, f, v): f.write(struct.pack('<I', v))
+    def _w_u64(self, f, v): f.write(struct.pack('<Q', v))
+    def _w_f32(self, f, v): f.write(struct.pack('<f', v))
+    def _w_bool(self, f, v): f.write(struct.pack('<?', bool(v)))
+    def _w_str(self, f, s:str):
+        b = s.encode('utf-8'); self._w_u64(f, len(b)); f.write(b)
+
+    def _write_kv(self, f):
+        self._w_u64(f, len(self.kv))
+        for key, (tp, payload) in self.kv:
+            self._w_str(f, key)
+            self._w_u32(f, tp)
+            if tp == GGUF_TYPE_UINT32:
+                self._w_u32(f, int(payload))
+            elif tp == GGUF_TYPE_FLOAT32:
+                self._w_f32(f, float(payload))
+            elif tp == GGUF_TYPE_BOOL:
+                self._w_bool(f, bool(payload))
+            elif tp == GGUF_TYPE_STRING:
+                self._w_str(f, payload)
+            elif tp == GGUF_TYPE_ARRAY:
+                subtype, arr = payload
+                self._w_u32(f, subtype)
+                self._w_u64(f, len(arr))
+                if subtype == GGUF_ARRAY_STRING:
+                    for s in arr: self._w_str(f, s)
+                elif subtype == GGUF_ARRAY_FLOAT32:
+                    for x in arr: self._w_f32(f, float(x))
+                elif subtype == GGUF_ARRAY_UINT32:
+                    for x in arr: self._w_u32(f, int(x))
+                else:
+                    raise ValueError("Unsupported array subtype")
+            else:
+                raise ValueError("Unsupported KV type")
+
+    def _write_tensors_index(self, f):
+        self._w_u64(f, len(self.tensors))
+        # Precompute offsets (each tensor data aligned to 32)
+        offset = 0
+        headers = []
+        for name, arr in self.tensors:
+            n_dims = arr.ndim
+            dims = list(arr.shape)[::-1]  # reverse order in GGUF
+            dtype_code = T_DTYPE_MAP[str(arr.dtype)]
+            nbytes = arr.nbytes
+            headers.append((name, n_dims, dims, dtype_code, offset, nbytes))
+            offset += nbytes + ((-nbytes) % 32)
+        for name, n_dims, dims, dtype_code, off, nbytes in headers:
+            self._w_str(f, name)
+            self._w_u32(f, n_dims)
+            for d in dims: self._w_u64(f, d)
+            self._w_u32(f, dtype_code)
+            self._w_u64(f, off)
+            self._w_u64(f, nbytes)
+        return headers
+
+    def write(self):
+        with open(self.path, 'wb') as f:
+            f.write(GGUF_MAGIC)
+            self._w_u32(f, GGUF_VERSION)
+            self._write_kv(f)
+            headers = self._write_tensors_index(f)
+            align_to(f, 32)
+            # write data
+            for (_, arr), (_,_,_,_,_, nbytes) in zip(self.tensors, headers):
+                f.write(arr.tobytes(order='C'))
+                pad = (-nbytes) % 32
+                if pad: f.write(b'\x00'*pad)
+        return self.path
+
+# ============================================================
 # Training
-# ----------------------------
+# ============================================================
 def _to_np(t: torch.Tensor, dtype: str):
     if dtype == 'float16':
         return t.detach().half().contiguous().cpu().numpy()
@@ -342,11 +352,9 @@ def train_once(run_name:str, data_path:str, models_dir:str,
                lr:float, batch_size:int, max_epochs:int,
                weight_dtype:str='float16', amp_enabled:bool=True,
                progress_cb=None):
+    # --- device + env diag ---
     cuda_ok = torch.cuda.is_available()
-    device = 'cuda' if cuda_ok else (
-        'mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu')
-    if device == 'mps':  # на всякий случай
-        device = 'cuda' if cuda_ok else 'mps'
+    device = 'cuda' if cuda_ok else 'cpu'
     if progress_cb:
         diag = {
             "torch": torch.__version__,
@@ -357,31 +365,35 @@ def train_once(run_name:str, data_path:str, models_dir:str,
             "device": device,
         }
         if cuda_ok:
-            diag["cuda_name0"] = torch.cuda.get_device_name(0)
+            try: diag["cuda_name0"] = torch.cuda.get_device_name(0)
+            except Exception: pass
         progress_cb("ENV " + json.dumps(diag))
-    os.makedirs(models_dir, exist_ok=True)
 
+    os.makedirs(models_dir, exist_ok=True)
     corpus = Path(data_path)
     assert corpus.exists(), f"Missing {data_path}"
 
-    tok_path = Path(models_dir) / f"{run_name}.tokenizer.json"
-    tokenizer = build_tokenizer(corpus, vocab_size, tok_path)
+    # --- tokenizer (train once in-memory, no external JSON) ---
+    if not HAVE_TOKENIZERS:
+        raise RuntimeError("Install `tokenizers` package to use BPE: pip install tokenizers")
+    tokenizer, tokens_tbl, merges_tbl = build_bpe_tokenizer_and_extract_tables(corpus, vocab_size)
 
+    # --- make ids ---
     text = corpus.read_text(encoding='utf-8')
     ids = tokenizer.encode(text)
     ids = torch.tensor(ids, dtype=torch.long)
 
-    # split
+    # train/val split
     val_split = 0.01
     n = len(ids)
     train_len = max(0, int(n*(1.0-val_split)))
     train_ids, val_ids = ids[:train_len], ids[train_len:] if n - train_len > block_size+1 else ids[:]
-
     train_ds = TextDataset(train_ids.tolist(), block_size)
     val_ds   = TextDataset(val_ids.tolist(), block_size)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True)
 
+    # --- model ---
     cfg = GPTConfig(vocab_size=tokenizer.vocab_size, n_layer=n_layer, n_head=n_head,
                     n_embd=n_embd, block_size=block_size, dropout=0.1, dtype=weight_dtype, use_rope=True)
     model = GPT(cfg).to(device)
@@ -391,7 +403,6 @@ def train_once(run_name:str, data_path:str, models_dir:str,
 
     total_steps = max_epochs * max(1, len(train_loader))
     started = time.time()
-
     if progress_cb:
         progress_cb(f"Training started (device={device}, AMP={scaler.is_enabled()})")
 
@@ -411,11 +422,10 @@ def train_once(run_name:str, data_path:str, models_dir:str,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt); scaler.update()
 
-            step_time = time.time() - t0  # seconds per iteration
+            step_time = time.time() - t0
 
             global_step += 1
             step_in_epoch += 1
-
             pct = 100.0 * global_step / max(1, total_steps)
             elapsed_m = (time.time() - started) / 60.0
             eta_m = (elapsed_m / max(1e-9, pct/100.0)) - elapsed_m if pct > 0 else 0.0
@@ -439,33 +449,43 @@ def train_once(run_name:str, data_path:str, models_dir:str,
             if progress_cb: progress_cb(f"Validation loss: {v:.4f}")
             if v < best_val: best_val = v
 
+    # --- write single GGUF (weights + tokenizer)
     stamp = time.strftime('%Y%m%d-%H%M%S')
-    out_path = Path(models_dir) / f"{run_name}-{stamp}.ggufx"
+    out_path = Path(models_dir) / f"{run_name}-{stamp}.gguf"
+    writer = GGUFWriter(str(out_path))
 
-    meta = {
-        "format": "GGUFx",
-        "version": 1,
-        "model": {"arch":"gpt-decoder", "cfg": asdict(cfg)},
-        "tokenizer_file": str(Path(tok_path).name),
-        "created": stamp,
-    }
+    # general/model KV
+    writer.add_str ("general.architecture", "gpt-neox")
+    writer.add_u32 ("vocab_size", cfg.vocab_size)
+    writer.add_u32 ("context_length", cfg.block_size)
+    writer.add_u32 ("embedding_length", cfg.n_embd)
+    writer.add_u32 ("block_count", cfg.n_layer)
+    writer.add_u32 ("attention.head_count", cfg.n_head)
+    writer.add_bool("rope.enabled", bool(cfg.use_rope))
 
-    writer = GGUFxWriter(str(out_path), meta)
+    # tokenizer KV (embedded, no external JSON)
+    writer.add_str("tokenizer.ggml.model", "bpe")
+    writer.add_arr_str("tokenizer.ggml.tokens", tokens_tbl)
+    writer.add_arr_str("tokenizer.ggml.merges", merges_tbl)
+    # special ids (align with our wrapper: <pad>=0, <bos>=1, <eos>=2)
+    writer.add_u32("vocab.special_pad_id", 0)
+    writer.add_u32("vocab.special_bos_id", 1)
+    writer.add_u32("vocab.special_eos_id", 2)
+
+    # tensors
     for name, tensor in model.state_dict().items():
         arr = _to_np(tensor, cfg.dtype)
         writer.add_tensor(name, arr)
-    saved = writer.write()
 
+    saved = writer.write()
     if progress_cb:
         progress_cb(f"Saved weights: {saved}")
-        progress_cb(f"Saved tokenizer: {tok_path}")
         progress_cb("DONE")
-
     return str(saved)
 
-# ----------------------------
-# Flask UI (SSE via queue+thread)
-# ----------------------------
+# ============================================================
+# Flask UI (SSE via queue+thread, single-run lock)
+# ============================================================
 from flask import Flask, request, Response, render_template_string, stream_with_context
 
 HTML = """<!doctype html>
@@ -477,6 +497,7 @@ body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#f7f7fb;margin:0}
 label{display:inline-block;margin:6px 12px 6px 0}
 input,select{padding:8px;border:1px solid #ddd;border-radius:8px}
 button{padding:10px 14px;border-radius:10px;border:1px solid #4f46e5;background:#4f46e5;color:#fff;cursor:pointer}
+button[disabled]{opacity:.5;cursor:not-allowed}
 .bar{height:8px;background:#ececff;border-radius:999px;overflow:hidden}
 .bar i{display:block;height:100%;width:0%;background:#4f46e5}
 .grid{display:grid;grid-template-columns:repeat(7,minmax(120px,1fr));gap:8px;margin-top:8px}
@@ -501,13 +522,12 @@ footer div a{color:inherit}
       <label>D_model <input id="dmodel" type="number" value="256" min="64" max="1024"></label>
       <label>Heads <input id="heads" type="number" value="4" min="1" max="16"></label>
       <label>Layers <input id="layers" type="number" value="4" min="1" max="48"></label>
-      <label>FF <input id="dff" type="number" value="1024" min="128" max="8192"></label>
       <label>Seq <input id="seq" type="number" value="256" min="32" max="4096"></label>
       <label>Batch <input id="bs" type="number" value="64" min="1" max="512"></label>
       <label>Epochs <input id="ep" type="number" value="2" min="1" max="100"></label>
       <label>LR <input id="lr" step="0.0001" type="number" value="0.001"></label>
       <label><input id="amp" type="checkbox" checked> Use AMP (Tensor Cores)</label>
-      <button>Start training</button>
+      <button id="btn">Start training</button>
     </form>
   </div>
 
@@ -527,7 +547,7 @@ footer div a{color:inherit}
     <pre id="log"></pre>
   </div>
   <footer>
-    <div><strong>PyAiModel TFormer</strong> — BPE, RoPE, SwiGLU, CUDA AMP, GGUFx export.</div>
+    <div><strong>PyAiModel TFormer</strong> — BPE, RoPE, SwiGLU, CUDA AMP, single-file GGUF export.</div>
     <div>© <span id="year">2025</span>. MIT.</div>
   </footer>
 </div>
@@ -553,62 +573,56 @@ footer div a{color:inherit}
     if (elapsed) $('s_elapsed').textContent = elapsed;
     if (eta) $('s_eta').textContent = eta || '—';
   }
+  let es = null;
+  function setBusy(b){ $('btn').disabled = b; }
   window.start = function(){
     const sel = $('ds');
     if (!sel || !sel.value || sel.value.indexOf('.txt') === -1) {
       alert('Выбери dataset (.txt) в списке.');
       return;
     }
+    setBusy(true);
     const params = new URLSearchParams({
       ds: sel.value,
       dmodel: val('dmodel'),
       heads:  val('heads'),
       layers: val('layers'),
-      dff:    val('dff'),
       seq:    val('seq'),
       bs:     val('bs'),
       ep:     val('ep'),
       lr:     val('lr'),
       amp:    $('amp').checked ? '1':'0'
     });
-    const es  = new EventSource('/train?' + params.toString());
+    es  = new EventSource('/train?' + params.toString());
     const log = $('log');
     es.onmessage = function(e){
       const line = e.data || '';
-      if (line.startsWith('PCT:')){
-        $('p').style.width = line.slice(4) + '%';
-        $('s_pct').textContent = line.slice(4) + '%';
-      } else {
-        if (line.startsWith('Training started')){
-          const mdev = line.match(/device=([^,\\)]+)/);
-          const mamp = line.match(/AMP=(True|False)/);
-          $('s_device').textContent = 'device: ' + (mdev ? mdev[1] : '—') + ' | AMP: ' + (mamp ? mamp[1] : '—');
-        }
-        if (line.startsWith('ENV ')) {
-  try {
-    const env = JSON.parse(line.slice(4));
-    const dev = env.device + (env.cuda_name0 ? ` (${env.cuda_name0})` : '');
-    $('s_device').textContent = `device: ${dev} | AMP: ${('cuda_available' in env) ? (env.cuda_available ? 'True' : 'False') : '—'}`;
-  } catch (e) {}
-}
-        if (line.startsWith('Progress:')) parseProgress(line);
-        log.textContent += line + "\\n";
-        log.scrollTop = log.scrollHeight;
+      if (line.startsWith('ENV ')) {
+        try {
+          const env = JSON.parse(line.slice(4));
+          const dev = env.device + (env.cuda_name0 ? ` (${env.cuda_name0})` : '');
+          $('s_device').textContent = `device: ${dev} | AMP: ${env.cuda_available ? 'True' : 'False'}`;
+        } catch (_){}
+        return;
       }
-      if (line === 'DONE') es.close();
+      if (line.startsWith('Progress:')) parseProgress(line);
+      if (line === 'DONE'){ es.close(); setBusy(false); return; }
+      if (line.startsWith('ERR:busy')){ alert('Тренировка уже идёт'); es.close(); setBusy(false); return; }
+      log.textContent += line + "\\n";
+      log.scrollTop = log.scrollHeight;
     };
     es.onerror = function(){
-      es.close();
-      alert('Поток прерван. Смотри Network/Console и логи в терминале Flask.');
+      if (es){ es.close(); }
+      setBusy(false);
+      alert('Поток прерван. Смотри логи в терминале.');
     };
   };
 })();
 </script>
-</body></html>
-"""
+</body></html>"""
 
-from flask import Flask, request, Response, render_template_string, stream_with_context
 app = Flask(__name__)
+TRAIN_LOCK = Lock()
 
 @app.route("/")
 def index():
@@ -617,8 +631,7 @@ def index():
     datasets = sorted([p.name for p in ds_dir.glob("*.txt")])
     return render_template_string(HTML, datasets=datasets)
 
-def _sse_yield(line:str):  # one SSE message
-    return f"data: {line}\n\n"
+def _sse(line:str): return f"data: {line}\n\n"
 
 @app.route("/train")
 def train_route():
@@ -627,7 +640,6 @@ def train_route():
     dmodel = int(request.args.get("dmodel", 256))
     heads  = int(request.args.get("heads", 4))
     layers = int(request.args.get("layers", 4))
-    dff    = int(request.args.get("dff", 1024))  # not used directly with SwiGLU sizing; kept for UI symmetry
     seq    = int(request.args.get("seq", 256))
     bs     = int(request.args.get("bs", 64))
     ep     = int(request.args.get("ep", 2))
@@ -638,15 +650,18 @@ def train_route():
     models_dir = "Models"
     vocab_size = 32000
 
-    # auto run_name (без поля Out name)
+    # auto run_name (без внешних токенайзеров)
     stamp = time.strftime('%Y%m%d-%H%M%S')
     base = Path(ds).stem
     run_name = f"{base}-d{dmodel}h{heads}l{layers}-seq{seq}-bs{bs}-{stamp}"
 
+    # single-run lock
+    if not TRAIN_LOCK.acquire(blocking=False):
+        return Response(_sse("ERR:busy") + _sse("DONE"), mimetype="text/event-stream")
+
     q: Queue[str] = Queue()
 
-    def progress_cb(msg: str):
-        q.put(msg)
+    def progress_cb(msg: str): q.put(msg)
 
     def worker():
         try:
@@ -666,30 +681,29 @@ def train_route():
                 amp_enabled=amp,
                 progress_cb=progress_cb
             )
-            q.put(f"Model saved: {saved_path}")
+            q.put(f"Saved weights: {saved_path}")
         except Exception as e:
             q.put(f"ERROR: {type(e).__name__}: {e}")
         finally:
             q.put("DONE")
+            TRAIN_LOCK.release()
 
     Thread(target=worker, daemon=True).start()
 
     def stream():
-        #yield _sse_yield(f"Training started (device={'cuda' if torch.cuda.is_available() else 'cpu'}, AMP={amp})")
         while True:
             try:
                 msg = q.get(timeout=1.0)
-                yield _sse_yield(msg)
-                if msg == "DONE":
-                    break
+                yield _sse(msg)
+                if msg == "DONE": break
             except Empty:
                 pass
 
     return Response(stream_with_context(stream()), mimetype="text/event-stream")
 
-# ----------------------------
-# CLI entry
-# ----------------------------
+# ============================================================
+# CLI
+# ============================================================
 def cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--run', type=str, default=None, help='If set, run a CLI training (no Flask UI)')
