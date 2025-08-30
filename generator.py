@@ -72,11 +72,23 @@ def build_bpe_tokenizer_and_extract_tables(corpus_path: Path, vocab_size: int):
         max_id = max(inv) if inv else -1
         tokens = [inv.get(i, "") for i in range(max_id+1)]
         merges = obj.get("model", {}).get("merges", [])
+        merges = [" ".join(m) if isinstance(m, (list, tuple)) else m for m in merges]
     finally:
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
+        # --- normalize tables so GGUF gets pure strings ---
+
+    def _str_or_join(x):
+        if isinstance(x, str): return x
+        if isinstance(x, (list, tuple)):
+            return " ".join(str(t) for t in x)
+        return str(x)
+
+    tokens = ["" if t is None else (t if isinstance(t, str) else str(t)) for t in tokens]
+    merges = [_str_or_join(m) for m in merges]
 
     return BPETokenizerWrapper(tok), tokens, merges
 
@@ -252,8 +264,17 @@ class GGUFWriter:
     def add_f32(self, key, v:float):    self.kv.append((key, (GGUF_TYPE_FLOAT32, v)))
     def add_bool(self, key, v:bool):    self.kv.append((key, (GGUF_TYPE_BOOL, bool(v))))
     def add_str(self, key, s:str):      self.kv.append((key, (GGUF_TYPE_STRING, s)))
-    def add_arr_str(self, key, arr:list[str]):
-        self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_STRING, arr))))
+
+    def add_arr_str(self, key, arr: list):
+        norm = []
+        for x in arr:
+            if isinstance(x, str):
+                norm.append(x)
+            elif isinstance(x, (list, tuple)):
+                norm.append(" ".join(str(t) for t in x))
+            else:
+                norm.append(str(x))
+        self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_STRING, norm))))
     def add_arr_f32(self, key, arr:list[float]):
         self.kv.append((key, (GGUF_TYPE_ARRAY, (GGUF_ARRAY_FLOAT32, arr))))
     def add_arr_u32(self, key, arr:list[int]):
